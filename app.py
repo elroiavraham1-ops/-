@@ -2,7 +2,6 @@ import streamlit as st
 import pandas as pd
 from datetime import datetime, timedelta, time as dtime
 import itertools
-import statistics
 
 # ננסה לייבא את מנוע החישוב
 try:
@@ -51,9 +50,6 @@ def resolve_window(start_str, end_str):
 def fmt(minute):
     return (HORIZON_START + timedelta(minutes=minute)).strftime("%H:%M")
 
-def overlap(a0, a1, b0, b1):
-    return max(0, min(a1, b1) - max(a0, b0))
-
 # ==========================================
 # 2. מנוע השיבוץ הראשי (OR-Tools)
 # ==========================================
@@ -66,10 +62,13 @@ def generate_schedule(tasks_df, people_df, min_rest_hours):
     shifts = []
     for idx, row in tasks_df.iterrows():
         name = row['שם משימה']
-        kind = row['סוג (עמדה/כוננות/מטבח)']
+        kind = row['סוג']
         people_req = int(row['כמות אנשים'])
         shift_hours = float(row['אורך משמרת (שעות)'])
-        req_role = row['תפקיד נדרש (למשל: מפקד)']
+        req_role = row['תפקיד נדרש']
+        
+        counts_as_work = bool(row.get('נחשב עבודה?', True))
+        requires_rest = bool(row.get('דורש מנוחה?', True))
         
         roles = [req_role] if pd.notna(req_role) and req_role.strip() != "" else []
         
@@ -84,11 +83,12 @@ def generate_schedule(tasks_df, people_df, min_rest_hours):
             cur = w0
             while cur < w1:
                 end = min(cur + length, w1)
-                units = int(round((end - cur) / 60 * units_per_hour))
+                # משימה שלא נחשבת עבודה (כמו כרמל) תקבל 0 יחידות עומס
+                units = int(round((end - cur) / 60 * units_per_hour)) if counts_as_work else 0
                 shifts.append({
                     'idx': len(shifts), 'name': name, 'kind': kind, 
                     'start': cur, 'end': end, 'need': people_req, 
-                    'units': units, 'roles': roles
+                    'units': units, 'roles': roles, 'req_rest': requires_rest
                 })
                 cur = end
 
@@ -114,10 +114,10 @@ def generate_schedule(tasks_df, people_df, min_rest_hours):
         p_block = set()
         
         for s in shifts:
-            # חסימה אם זמן המשמרת חופף לזמן אי-זמינות
-            if any(overlap(s['start'], s['end'], a, b) > 0 for a, b in unavail):
+            # חפיפה של שעות חסימה
+            if any(max(0, min(s['end'], b) - max(s['start'], a)) > 0 for a, b in unavail):
                 p_block.add(s['idx'])
-            # חסימה אם למשמרת חסר תפקיד נדרש
+            # דרישת תפקיד
             if s['roles'] and not any(r in people_roles[pname] for r in s['roles']):
                 p_block.add(s['idx'])
                 
@@ -129,10 +129,17 @@ def generate_schedule(tasks_df, people_df, min_rest_hours):
     total_units = sum(hist_u.values()) + sum(s['need'] * s['units'] for s in shifts)
     target = int(round(total_units / len(present)))
     
+    # בניית ההתנגשויות (כפילויות ומנוחה)
     conflicts = []
     for a, b in itertools.combinations(shifts, 2):
-        if a['start'] < b['end'] + min_rest and b['start'] < a['end'] + min_rest:
+        # תמיד אסור להיות בשני מקומות במקביל (חפיפה פיזית)
+        if a['start'] < b['end'] and b['start'] < a['end']:
             conflicts.append((a['idx'], b['idx']))
+        else:
+            # בדיקת מנוחה - רק אם שתי המשימות דורשות מנוחה! אם אחת היא מנוחה (כרמל), מותר לשבץ ברצף
+            r = min_rest if (a['req_rest'] and b['req_rest']) else 0
+            if a['start'] < b['end'] + r and b['start'] < a['end'] + r:
+                conflicts.append((a['idx'], b['idx']))
 
     # מודל ה-CP
     m = cp_model.CpModel()
@@ -142,18 +149,16 @@ def generate_schedule(tasks_df, people_df, min_rest_hours):
             if s['idx'] not in blocked[p]:
                 x[(p, s['idx'])] = m.new_bool_var(f"x_{p}_{s['idx']}")
 
-    # אילוץ 1: כמות אנשים מדויקת בעמדה
+    # כמות אנשים מדויקת בעמדה
     for s in shifts:
         staffed = sum(x[(p, s['idx'])] for p in present if (p, s['idx']) in x)
         m.add(staffed == s['need'])
 
-    # אילוץ 2: מנוחה וכפילויות
+    # אילוץ מנוחה וכפילויות
     for p in present:
         for i, j in conflicts:
             if (p, i) in x and (p, j) in x:
                 m.add_at_most_one([x[(p, i)], x[(p, j)]])
-
-    # אילוץ 3: מטבח (חוסם לכל היום) - פשוט נגדיר שלא משבצים אדם ל-2 סוגי משימות חופפות
     
     # מטרת הוגנות
     sq = []
@@ -198,16 +203,17 @@ st.markdown("ערוך את נתוני המשימות והצוות ישירות �
 st.sidebar.header("הגדרות כלליות")
 min_rest_ui = st.sidebar.number_input("שעות מנוחה מינימליות בין משמרות:", min_value=0.0, max_value=8.0, value=2.0, step=0.5)
 
-# נתוני ברירת מחדל למשימות
+# נתוני ברירת מחדל למשימות עם העמודות החדשות
 default_tasks = pd.DataFrame([
-    {"שם משימה": "עמדת אדום (לילה)", "סוג (עמדה/כוננות/מטבח)": "עמדה", "כמות אנשים": 2, "אורך משמרת (שעות)": 2.0, "תפקיד נדרש (למשל: מפקד)": "", "שעת התחלה (HH:MM)": "20:00", "שעת סיום (HH:MM)": "06:00"},
-    {"שם משימה": "עמדת אדום (יום)", "סוג (עמדה/כוננות/מטבח)": "עמדה", "כמות אנשים": 1, "אורך משמרת (שעות)": 2.0, "תפקיד נדרש (למשל: מפקד)": "", "שעת התחלה (HH:MM)": "06:00", "שעת סיום (HH:MM)": "20:00"},
-    {"שם משימה": "כרמל א' - מפקד", "סוג (עמדה/כוננות/מטבח)": "כוננות", "כמות אנשים": 1, "אורך משמרת (שעות)": 4.0, "תפקיד נדרש (למשל: מפקד)": "מפקד", "שעת התחלה (HH:MM)": "12:00", "שעת סיום (HH:MM)": "20:00"},
-    {"שם משימה": "כרמל א' - לוחמים", "סוג (עמדה/כוננות/מטבח)": "כוננות", "כמות אנשים": 5, "אורך משמרת (שעות)": 4.0, "תפקיד נדרש (למשל: מפקד)": "", "שעת התחלה (HH:MM)": "12:00", "שעת סיום (HH:MM)": "20:00"},
-    {"שם משימה": "תורן מטבח", "סוג (עמדה/כוננות/מטבח)": "מטבח", "כמות אנשים": 1, "אורך משמרת (שעות)": 24.0, "תפקיד נדרש (למשל: מפקד)": "", "שעת התחלה (HH:MM)": "", "שעת סיום (HH:MM)": ""},
+    {"שם משימה": "עמדת אדום (לילה)", "סוג": "עמדה", "כמות אנשים": 2, "אורך משמרת (שעות)": 2.0, "תפקיד נדרש": "", "שעת התחלה (HH:MM)": "20:00", "שעת סיום (HH:MM)": "06:00", "נחשב עבודה?": True, "דורש מנוחה?": True},
+    {"שם משימה": "עמדת אדום (יום)", "סוג": "עמדה", "כמות אנשים": 1, "אורך משמרת (שעות)": 2.0, "תפקיד נדרש": "", "שעת התחלה (HH:MM)": "06:00", "שעת סיום (HH:MM)": "20:00", "נחשב עבודה?": True, "דורש מנוחה?": True},
+    {"שם משימה": "כרמל א' - מפקד", "סוג": "כוננות", "כמות אנשים": 1, "אורך משמרת (שעות)": 4.0, "תפקיד נדרש": "מפקד", "שעת התחלה (HH:MM)": "12:00", "שעת סיום (HH:MM)": "20:00", "נחשב עבודה?": False, "דורש מנוחה?": False},
+    {"שם משימה": "כרמל א' - לוחמים", "סוג": "כוננות", "כמות אנשים": 5, "אורך משמרת (שעות)": 4.0, "תפקיד נדרש": "", "שעת התחלה (HH:MM)": "12:00", "שעת סיום (HH:MM)": "20:00", "נחשב עבודה?": False, "דורש מנוחה?": False},
+    {"שם משימה": "כרמל ב' - מפקד", "סוג": "כוננות", "כמות אנשים": 1, "אורך משמרת (שעות)": 4.0, "תפקיד נדרש": "מפקד", "שעת התחלה (HH:MM)": "22:00", "שעת סיום (HH:MM)": "06:00", "נחשב עבודה?": False, "דורש מנוחה?": False},
+    {"שם משימה": "כרמל ב' - לוחמים", "סוג": "כוננות", "כמות אנשים": 5, "אורך משמרת (שעות)": 4.0, "תפקיד נדרש": "", "שעת התחלה (HH:MM)": "22:00", "שעת סיום (HH:MM)": "06:00", "נחשב עבודה?": False, "דורש מנוחה?": False},
+    {"שם משימה": "תורן מטבח", "סוג": "מטבח", "כמות אנשים": 1, "אורך משמרת (שעות)": 24.0, "תפקיד נדרש": "", "שעת התחלה (HH:MM)": "", "שעת סיום (HH:MM)": "", "נחשב עבודה?": True, "דורש מנוחה?": True},
 ])
 
-# נתוני ברירת מחדל לאנשים
 default_people = pd.DataFrame([
     {"שם": "אלרואי", "שעות היסטוריות": 0.0, "מפקד?": True, "יצא הביתה?": False, "לא זמין מ- (HH:MM)": "", "לא זמין עד- (HH:MM)": ""},
     {"שם": "גיא", "שעות היסטוריות": 12.5, "מפקד?": True, "יצא הביתה?": False, "לא זמין מ- (HH:MM)": "", "לא זמין עד- (HH:MM)": ""},
@@ -216,7 +222,17 @@ default_people = pd.DataFrame([
 ])
 
 st.subheader("📋 הגדרת משימות ועמדות")
-tasks_df = st.data_editor(default_tasks, num_rows="dynamic", use_container_width=True)
+tasks_df = st.data_editor(
+    default_tasks, 
+    num_rows="dynamic", 
+    use_container_width=True,
+    column_config={
+        "סוג": st.column_config.SelectboxColumn("סוג משימה", options=["עמדה", "כוננות", "מטבח"]),
+        "תפקיד נדרש": st.column_config.SelectboxColumn("תפקיד נדרש", options=["", "מפקד"]),
+        "נחשב עבודה?": st.column_config.CheckboxColumn("נחשב עבודה?"),
+        "דורש מנוחה?": st.column_config.CheckboxColumn("דורש מנוחה?")
+    }
+)
 
 st.subheader("👥 ניהול כוח אדם ואילוצים")
 people_df = st.data_editor(default_people, num_rows="dynamic", use_container_width=True)
