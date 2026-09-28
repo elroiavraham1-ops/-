@@ -10,13 +10,10 @@ except ImportError:
     st.error("שגיאה: חסרה ספריית ortools. יש לוודא שהיא מותקנת.")
 
 # ==========================================
-# 1. הגדרות ופונקציות בסיס למנוע החישוב
+# 1. פונקציות בסיס (דינמיות לפי שעת התחלה)
 # ==========================================
-HORIZON_START = datetime(2026, 9, 28, 6, 0)
-HORIZON_HOURS = 24
-
 def clock(text):
-    if not text or pd.isna(text) or text.strip() == "":
+    if not text or pd.isna(text) or str(text).strip() == "":
         return None
     try:
         hh, mm = str(text).strip().split(":")
@@ -24,41 +21,40 @@ def clock(text):
     except:
         return None
 
-def resolve_window(start_str, end_str):
-    if not start_str or not end_str or pd.isna(start_str) or pd.isna(end_str):
+def resolve_window(start_str, end_str, horizon_start_dt, horizon_hours=24):
+    if not start_str or not end_str or pd.isna(start_str) or pd.isna(end_str) or str(start_str).strip() == "":
         return []
     ta = clock(start_str)
     tb = clock(end_str)
     if not ta or not tb:
         return []
     
-    d0 = datetime.combine(HORIZON_START.date(), ta)
-    length = (datetime.combine(HORIZON_START.date(), tb) - d0) % timedelta(days=1)
+    d0 = datetime.combine(horizon_start_dt.date(), ta)
+    length = (datetime.combine(horizon_start_dt.date(), tb) - d0) % timedelta(days=1)
     if length == timedelta(0):
         length = timedelta(days=1)
     
     raw = [(d0 + timedelta(days=k), d0 + timedelta(days=k) + length) for k in range(-1, 3)]
     out = []
-    horizon_end = HORIZON_START + timedelta(hours=HORIZON_HOURS)
+    horizon_end = horizon_start_dt + timedelta(hours=horizon_hours)
     for s, e in raw:
-        lo, hi = max(s, HORIZON_START), min(e, horizon_end)
+        lo, hi = max(s, horizon_start_dt), min(e, horizon_end)
         if lo < hi:
-            out.append((int((lo - HORIZON_START).total_seconds() // 60), 
-                        int((hi - HORIZON_START).total_seconds() // 60)))
+            out.append((int((lo - horizon_start_dt).total_seconds() // 60), 
+                        int((hi - horizon_start_dt).total_seconds() // 60)))
     return out
 
-def fmt(minute):
-    return (HORIZON_START + timedelta(minutes=minute)).strftime("%H:%M")
+def fmt(minute, horizon_start_dt):
+    return (horizon_start_dt + timedelta(minutes=minute)).strftime("%H:%M")
 
 # ==========================================
 # 2. מנוע השיבוץ הראשי (OR-Tools)
 # ==========================================
-def generate_schedule(tasks_df, people_df, min_rest_hours):
-    horizon_min = HORIZON_HOURS * 60
+def generate_schedule(tasks_df, people_df, min_rest_hours, horizon_start_dt, horizon_hours=24):
+    horizon_min = horizon_hours * 60
     min_rest = int(round(min_rest_hours * 60))
     units_per_hour = 10
 
-    # עיבוד משימות מהטבלה
     shifts = []
     for idx, row in tasks_df.iterrows():
         name = row['שם משימה']
@@ -72,10 +68,9 @@ def generate_schedule(tasks_df, people_df, min_rest_hours):
         
         roles = [req_role] if pd.notna(req_role) and req_role.strip() != "" else []
         
-        # זיהוי חלונות זמן
         windows = [(0, horizon_min)]
-        if pd.notna(row['שעת התחלה (HH:MM)']) and pd.notna(row['שעת סיום (HH:MM)']):
-            w = resolve_window(row['שעת התחלה (HH:MM)'], row['שעת סיום (HH:MM)'])
+        if pd.notna(row['שעת התחלה (HH:MM)']) and pd.notna(row['שעת סיום (HH:MM)']) and str(row['שעת התחלה (HH:MM)']).strip() != "":
+            w = resolve_window(row['שעת התחלה (HH:MM)'], row['שעת סיום (HH:MM)'], horizon_start_dt, horizon_hours)
             if w: windows = w
             
         length = int(round(shift_hours * 60))
@@ -83,7 +78,6 @@ def generate_schedule(tasks_df, people_df, min_rest_hours):
             cur = w0
             while cur < w1:
                 end = min(cur + length, w1)
-                # משימה שלא נחשבת עבודה (כמו כרמל) תקבל 0 יחידות עומס
                 units = int(round((end - cur) / 60 * units_per_hour)) if counts_as_work else 0
                 shifts.append({
                     'idx': len(shifts), 'name': name, 'kind': kind, 
@@ -92,7 +86,6 @@ def generate_schedule(tasks_df, people_df, min_rest_hours):
                 })
                 cur = end
 
-    # עיבוד אנשים מהטבלה
     present = []
     hist_u = {}
     blocked = {}
@@ -100,7 +93,7 @@ def generate_schedule(tasks_df, people_df, min_rest_hours):
     
     for _, row in people_df.iterrows():
         pname = row['שם']
-        if row.get('יצא הביתה?', False):
+        if row.get('יצא הביתה?', False) or not str(pname).strip():
             continue
             
         present.append(pname)
@@ -109,15 +102,12 @@ def generate_schedule(tasks_df, people_df, min_rest_hours):
         is_cmd = row.get('מפקד?', False)
         people_roles[pname] = ["מפקד"] if is_cmd else []
         
-        # אילוצי זמנים לאדם
-        unavail = resolve_window(row.get('לא זמין מ- (HH:MM)'), row.get('לא זמין עד- (HH:MM)'))
+        unavail = resolve_window(row.get('לא זמין מ- (HH:MM)'), row.get('לא זמין עד- (HH:MM)'), horizon_start_dt, horizon_hours)
         p_block = set()
         
         for s in shifts:
-            # חפיפה של שעות חסימה
             if any(max(0, min(s['end'], b) - max(s['start'], a)) > 0 for a, b in unavail):
                 p_block.add(s['idx'])
-            # דרישת תפקיד
             if s['roles'] and not any(r in people_roles[pname] for r in s['roles']):
                 p_block.add(s['idx'])
                 
@@ -129,19 +119,15 @@ def generate_schedule(tasks_df, people_df, min_rest_hours):
     total_units = sum(hist_u.values()) + sum(s['need'] * s['units'] for s in shifts)
     target = int(round(total_units / len(present)))
     
-    # בניית ההתנגשויות (כפילויות ומנוחה)
     conflicts = []
     for a, b in itertools.combinations(shifts, 2):
-        # תמיד אסור להיות בשני מקומות במקביל (חפיפה פיזית)
         if a['start'] < b['end'] and b['start'] < a['end']:
             conflicts.append((a['idx'], b['idx']))
         else:
-            # בדיקת מנוחה - רק אם שתי המשימות דורשות מנוחה! אם אחת היא מנוחה (כרמל), מותר לשבץ ברצף
             r = min_rest if (a['req_rest'] and b['req_rest']) else 0
             if a['start'] < b['end'] + r and b['start'] < a['end'] + r:
                 conflicts.append((a['idx'], b['idx']))
 
-    # מודל ה-CP
     m = cp_model.CpModel()
     x = {}
     for p in present:
@@ -149,18 +135,15 @@ def generate_schedule(tasks_df, people_df, min_rest_hours):
             if s['idx'] not in blocked[p]:
                 x[(p, s['idx'])] = m.new_bool_var(f"x_{p}_{s['idx']}")
 
-    # כמות אנשים מדויקת בעמדה
     for s in shifts:
         staffed = sum(x[(p, s['idx'])] for p in present if (p, s['idx']) in x)
         m.add(staffed == s['need'])
 
-    # אילוץ מנוחה וכפילויות
     for p in present:
         for i, j in conflicts:
             if (p, i) in x and (p, j) in x:
                 m.add_at_most_one([x[(p, i)], x[(p, j)]])
     
-    # מטרת הוגנות
     sq = []
     for p in present:
         work = sum(s['units'] * x[(p, s['idx'])] for s in shifts if (p, s['idx']) in x)
@@ -183,13 +166,16 @@ def generate_schedule(tasks_df, people_df, min_rest_hours):
         for s in shifts:
             assigned = [p for p in present if (p, s['idx']) in x and solver.value(x[(p, s['idx'])])]
             schedule.append({
-                "שעת התחלה": fmt(s['start']),
-                "שעת סיום": fmt(s['end']),
+                "סדר (פנימי)": s['start'],
+                "שעת התחלה": fmt(s['start'], horizon_start_dt),
+                "שעת סיום": fmt(s['end'], horizon_start_dt),
                 "סוג משימה": s['kind'],
                 "שם משימה": s['name'],
                 "צוות מוצב": ", ".join(assigned)
             })
-        return pd.DataFrame(schedule), "השיבוץ הושלם בהצלחה!"
+        df = pd.DataFrame(schedule)
+        df = df.sort_values(by=["סדר (פנימי)"]).drop(columns=["סדר (פנימי)"])
+        return df, "השיבוץ הושלם בהצלחה!"
     else:
         return None, "לא נמצא פתרון. נסה להוריד שעות מנוחה או להוסיף לוחמים."
 
@@ -198,28 +184,45 @@ def generate_schedule(tasks_df, people_df, min_rest_hours):
 # ==========================================
 st.set_page_config(page_title="מערכת שיבוץ מתקדמת", layout="wide", page_icon="🛡️")
 st.title("🛡️ מערכת שיבוץ וניהול משמרות אוטומטית")
-st.markdown("ערוך את נתוני המשימות והצוות ישירות בטבלאות שלמטה. המערכת תשקלל את כל האילוצים ותפיק סידור עבודה הוגן.")
 
+# בחירת תאריך ושעת התחלה
 st.sidebar.header("הגדרות כלליות")
+start_date = st.sidebar.date_input("תאריך תחילת הלוז:", value=datetime.today())
+start_time = st.sidebar.time_input("שעת תחילת הלוז:", value=dtime(6, 0))
+horizon_start_dt = datetime.combine(start_date, start_time)
 min_rest_ui = st.sidebar.number_input("שעות מנוחה מינימליות בין משמרות:", min_value=0.0, max_value=8.0, value=2.0, step=0.5)
 
-# נתוני ברירת מחדל למשימות עם העמודות החדשות
+st.markdown(f"**הלוז יחושב ל-24 שעות החל מ: {horizon_start_dt.strftime('%d/%m/%Y בשעה %H:%M')}**")
+
+# נתוני ברירת מחדל למשימות (מעודכן לפי הבקשה)
 default_tasks = pd.DataFrame([
-    {"שם משימה": "עמדת אדום (לילה)", "סוג": "עמדה", "כמות אנשים": 2, "אורך משמרת (שעות)": 2.0, "תפקיד נדרש": "", "שעת התחלה (HH:MM)": "20:00", "שעת סיום (HH:MM)": "06:00", "נחשב עבודה?": True, "דורש מנוחה?": True},
     {"שם משימה": "עמדת אדום (יום)", "סוג": "עמדה", "כמות אנשים": 1, "אורך משמרת (שעות)": 2.0, "תפקיד נדרש": "", "שעת התחלה (HH:MM)": "06:00", "שעת סיום (HH:MM)": "20:00", "נחשב עבודה?": True, "דורש מנוחה?": True},
-    {"שם משימה": "כרמל א' - מפקד", "סוג": "כוננות", "כמות אנשים": 1, "אורך משמרת (שעות)": 4.0, "תפקיד נדרש": "מפקד", "שעת התחלה (HH:MM)": "12:00", "שעת סיום (HH:MM)": "20:00", "נחשב עבודה?": False, "דורש מנוחה?": False},
-    {"שם משימה": "כרמל א' - לוחמים", "סוג": "כוננות", "כמות אנשים": 5, "אורך משמרת (שעות)": 4.0, "תפקיד נדרש": "", "שעת התחלה (HH:MM)": "12:00", "שעת סיום (HH:MM)": "20:00", "נחשב עבודה?": False, "דורש מנוחה?": False},
-    {"שם משימה": "כרמל ב' - מפקד", "סוג": "כוננות", "כמות אנשים": 1, "אורך משמרת (שעות)": 4.0, "תפקיד נדרש": "מפקד", "שעת התחלה (HH:MM)": "22:00", "שעת סיום (HH:MM)": "06:00", "נחשב עבודה?": False, "דורש מנוחה?": False},
-    {"שם משימה": "כרמל ב' - לוחמים", "סוג": "כוננות", "כמות אנשים": 5, "אורך משמרת (שעות)": 4.0, "תפקיד נדרש": "", "שעת התחלה (HH:MM)": "22:00", "שעת סיום (HH:MM)": "06:00", "נחשב עבודה?": False, "דורש מנוחה?": False},
+    {"שם משימה": "עמדת אדום (לילה)", "סוג": "עמדה", "כמות אנשים": 2, "אורך משמרת (שעות)": 2.0, "תפקיד נדרש": "", "שעת התחלה (HH:MM)": "20:00", "שעת סיום (HH:MM)": "06:00", "נחשב עבודה?": True, "דורש מנוחה?": True},
+    {"שם משימה": "עמדת כחול", "סוג": "עמדה", "כמות אנשים": 1, "אורך משמרת (שעות)": 2.0, "תפקיד נדרש": "", "שעת התחלה (HH:MM)": "", "שעת סיום (HH:MM)": "", "נחשב עבודה?": True, "דורש מנוחה?": True},
+    {"שם משימה": "עמדת לבן", "סוג": "עמדה", "כמות אנשים": 1, "אורך משמרת (שעות)": 2.0, "תפקיד נדרש": "", "שעת התחלה (HH:MM)": "", "שעת סיום (HH:MM)": "", "נחשב עבודה?": True, "דורש מנוחה?": True},
+    {"שם משימה": "עמדת שג", "סוג": "עמדה", "כמות אנשים": 1, "אורך משמרת (שעות)": 2.0, "תפקיד נדרש": "", "שעת התחלה (HH:MM)": "", "שעת סיום (HH:MM)": "", "נחשב עבודה?": True, "דורש מנוחה?": True},
+    {"שם משימה": "סיור יום (מפקד)", "סוג": "סיור", "כמות אנשים": 1, "אורך משמרת (שעות)": 4.0, "תפקיד נדרש": "מפקד", "שעת התחלה (HH:MM)": "12:00", "שעת סיום (HH:MM)": "20:00", "נחשב עבודה?": True, "דורש מנוחה?": True},
+    {"שם משימה": "סיור לילה (מפקד)", "סוג": "סיור", "כמות אנשים": 1, "אורך משמרת (שעות)": 4.0, "תפקיד נדרש": "מפקד", "שעת התחלה (HH:MM)": "00:00", "שעת סיום (HH:MM)": "08:00", "נחשב עבודה?": True, "דורש מנוחה?": True},
     {"שם משימה": "תורן מטבח", "סוג": "מטבח", "כמות אנשים": 1, "אורך משמרת (שעות)": 24.0, "תפקיד נדרש": "", "שעת התחלה (HH:MM)": "", "שעת סיום (HH:MM)": "", "נחשב עבודה?": True, "דורש מנוחה?": True},
 ])
 
-default_people = pd.DataFrame([
-    {"שם": "אלרואי", "שעות היסטוריות": 0.0, "מפקד?": True, "יצא הביתה?": False, "לא זמין מ- (HH:MM)": "", "לא זמין עד- (HH:MM)": ""},
-    {"שם": "גיא", "שעות היסטוריות": 12.5, "מפקד?": True, "יצא הביתה?": False, "לא זמין מ- (HH:MM)": "", "לא זמין עד- (HH:MM)": ""},
-    {"שם": "בן", "שעות היסטוריות": 10.0, "מפקד?": False, "יצא הביתה?": False, "לא זמין מ- (HH:MM)": "00:00", "לא זמין עד- (HH:MM)": "06:00"},
-    {"שם": "דן", "שעות היסטוריות": 8.0, "מפקד?": False, "יצא הביתה?": True, "לא זמין מ- (HH:MM)": "", "לא זמין עד- (HH:MM)": ""},
-])
+# רשימה שמית של 25 לוחמים (5 הראשונים הם מפקדים)
+names_list = ["אלרואי (מפקד)", "גיא (מפקד)", "בן (מפקד)", "דן (מפקד)", "יוסי (מפקד)", 
+              "עומר", "תומר", "עידו", "איתי", "רועי", "נועם", "דניאל", "ינאי", 
+              "אלי", "רמי", "רון", "ליאור", "גל", "פבל", "פטריק", "מקס", 
+              "הראל", "סמי", "אבי", "נדב"]
+
+people_data = []
+for i, name in enumerate(names_list):
+    people_data.append({
+        "שם": name, 
+        "שעות היסטוריות": 0.0, 
+        "מפקד?": True if i < 5 else False, 
+        "יצא הביתה?": False, 
+        "לא זמין מ- (HH:MM)": "", 
+        "לא זמין עד- (HH:MM)": ""
+    })
+default_people = pd.DataFrame(people_data)
 
 st.subheader("📋 הגדרת משימות ועמדות")
 tasks_df = st.data_editor(
@@ -227,19 +230,19 @@ tasks_df = st.data_editor(
     num_rows="dynamic", 
     use_container_width=True,
     column_config={
-        "סוג": st.column_config.SelectboxColumn("סוג משימה", options=["עמדה", "כוננות", "מטבח"]),
+        "סוג": st.column_config.SelectboxColumn("סוג משימה", options=["עמדה", "סיור", "כוננות", "מטבח"]),
         "תפקיד נדרש": st.column_config.SelectboxColumn("תפקיד נדרש", options=["", "מפקד"]),
         "נחשב עבודה?": st.column_config.CheckboxColumn("נחשב עבודה?"),
         "דורש מנוחה?": st.column_config.CheckboxColumn("דורש מנוחה?")
     }
 )
 
-st.subheader("👥 ניהול כוח אדם ואילוצים")
+st.subheader("👥 ניהול כוח אדם (25 לוחמים)")
 people_df = st.data_editor(default_people, num_rows="dynamic", use_container_width=True)
 
 if st.button("🚀 הפעל שיבוץ אוטומטי", type="primary"):
     with st.spinner('מחשב את חלוקת הנטל ההוגנת ביותר...'):
-        result_df, msg = generate_schedule(tasks_df, people_df, min_rest_ui)
+        result_df, msg = generate_schedule(tasks_df, people_df, min_rest_ui, horizon_start_dt)
         
         if result_df is not None:
             st.success(msg)
