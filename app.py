@@ -157,7 +157,6 @@ def fmt(minute, horizon_start_dt):
 # ==========================================
 def diagnose_failure(shifts, avail_off, avail_cmd, avail_sol, present_count, min_rest_hours, horizon_start_dt):
     timeline = {}
-    # בניית ציר זמן (דקה אחרי דקה) לראות כמה אנשים צריכים בו זמנית
     for s in shifts:
         for t in range(s['start'], s['end']):
             if t not in timeline:
@@ -167,24 +166,21 @@ def diagnose_failure(shifts, avail_off, avail_cmd, avail_sol, present_count, min
             timeline[t]['sol'] += s['need_sol']
             timeline[t]['tasks'].add(s['name'])
             
-    # סריקת ציר הזמן למציאת שעות שיא של עומס (צווארי בקבוק)
     for t in sorted(timeline.keys()):
         counts = timeline[t]
         time_str = fmt(t, horizon_start_dt)
         tasks_str = ", ".join(counts['tasks'])
         
+        # בדיקה היררכית
         if counts['off'] > avail_off:
             return f"בשעה {time_str} חסרים קצינים. המשימות באותה שעה ({tasks_str}) דורשות יחד {counts['off']} קצינים במקביל, אך יש רק {avail_off} זמינים במוצב."
-        if counts['cmd'] > avail_cmd:
-            return f"בשעה {time_str} חסרים מפקדים. המשימות באותה שעה ({tasks_str}) דורשות יחד {counts['cmd']} מפקדים במקביל, אך יש רק {avail_cmd} זמינים במוצב."
-        if counts['sol'] > avail_sol:
-            return f"בשעה {time_str} חסרים לוחמים. המשימות באותה שעה ({tasks_str}) דורשות יחד {counts['sol']} לוחמים במקביל, אך יש רק {avail_sol} זמינים במוצב."
+        if counts['off'] + counts['cmd'] > avail_off + avail_cmd:
+            return f"בשעה {time_str} חסרה שדרת פיקוד (קצינים/מפקדים). המשימות ({tasks_str}) דורשות יחד {counts['off'] + counts['cmd']} מפקדים וקצינים, אך יש רק {avail_off + avail_cmd} זמינים."
             
         total_need = counts['off'] + counts['cmd'] + counts['sol']
         if total_need > present_count:
             return f"בשעה {time_str} חסר כוח אדם באופן כללי. המשימות באותה שעה ({tasks_str}) דורשות במקביל {total_need} אנשים, אך יש רק {present_count} נוכחים במוצב."
             
-    # אם אין חוסר נקודתי בכוח אדם באף שנייה, הבעיה היא חוקי המנוחה
     return f"אין מספיק חיילים זמינים כדי לכסות גם את המשימות וגם את זמני המנוחה ({min_rest_hours} שעות). האלגוריתם נתקע כי לוחמים שסיימו משמרת חייבים לנוח, ולא נשארו מספיק לוחמים רעננים שיחליפו אותם. נסה להוריד את שעות המנוחה המינימליות או להוסיף כוח אדם."
 
 # ==========================================
@@ -262,14 +258,14 @@ def generate_schedule(tasks_df, people_df, min_rest_hours, horizon_start_dt, hor
     avail_cmd = sum(1 for p in present if people_roles[p] == "מפקד")
     avail_sol = sum(1 for p in present if people_roles[p] == "לוחם")
     
-    # בדיקת חוסר תפקידים ברמת המשימה הבודדת (לפני חישוב זמנים מורכב)
+    # בדיקת חוסר תפקידים ברמת המשימה הבודדת (בדיקה היררכית)
     for s in shifts:
         if s['need_off'] > avail_off:
-            return None, f"חסרים קצינים: במשימה '{s['name']}' נדרשים {s['need_off']} קצינים, אך יש רק {avail_off} זמינים."
-        if s['need_cmd'] > avail_cmd:
-            return None, f"חסרים מפקדים: במשימה '{s['name']}' נדרשים {s['need_cmd']} מפקדים, אך יש רק {avail_cmd} זמינים."
-        if s['need_sol'] > avail_sol:
-            return None, f"חסרים לוחמים: במשימה '{s['name']}' נדרשים {s['need_sol']} לוחמים, אך יש רק {avail_sol} זמינים."
+            return None, f"חסרים קצינים: במשימה '{s['name']}' נדרשים {s['need_off']} קצינים."
+        if s['need_off'] + s['need_cmd'] > avail_off + avail_cmd:
+            return None, f"חסרים מפקדים: במשימה '{s['name']}' נדרשים {s['need_cmd']} מפקדים (יחד עם הקצינים חסר פיקוד)."
+        if s['need_off'] + s['need_cmd'] + s['need_sol'] > avail_off + avail_cmd + avail_sol:
+            return None, f"חסר כוח אדם: במשימה '{s['name']}' נדרשים {s['need_sol']} לוחמים."
 
     if not shifts:
         return None, "לא סומנו משימות פעילות לשיבוץ."
@@ -289,12 +285,9 @@ def generate_schedule(tasks_df, people_df, min_rest_hours, horizon_start_dt, hor
     m = cp_model.CpModel()
     x = {}
     for p in present:
-        role = people_roles[p]
         for s in shifts:
             if s['idx'] in blocked[p]: continue
-            if role == "קצין" and s['need_off'] == 0: continue
-            if role == "מפקד" and s['need_cmd'] == 0: continue
-            if role == "לוחם" and s['need_sol'] == 0: continue
+            # יוצרים משתנה לכולם עבור כל משמרת פתוחה, כדי לאפשר למפקדים לרדת לרמת לוחם
             x[(p, s['idx'])] = m.new_bool_var(f"x_{p}_{s['idx']}")
 
     for s in shifts:
@@ -302,9 +295,13 @@ def generate_schedule(tasks_df, people_df, min_rest_hours, horizon_start_dt, hor
         staffed_cmd = sum(x[(p, s['idx'])] for p in present if people_roles[p] == "מפקד" and (p, s['idx']) in x)
         staffed_sol = sum(x[(p, s['idx'])] for p in present if people_roles[p] == "לוחם" and (p, s['idx']) in x)
         
-        m.add(staffed_off == s['need_off'])
-        m.add(staffed_cmd == s['need_cmd'])
-        m.add(staffed_sol == s['need_sol'])
+        # אילוצים היררכיים (תחליפיות)
+        # 1. חייבים מספיק קצינים לתפקיד קצין
+        m.add(staffed_off >= s['need_off'])
+        # 2. קצינים + מפקדים יכולים למלא תפקידי פיקוד
+        m.add(staffed_off + staffed_cmd >= s['need_off'] + s['need_cmd'])
+        # 3. סך הכל האנשים (כולל לוחמים) חייב להיות בדיוק המספר הנדרש
+        m.add(staffed_off + staffed_cmd + staffed_sol == s['need_off'] + s['need_cmd'] + s['need_sol'])
 
     for p in present:
         for i, j in conflicts:
@@ -331,6 +328,7 @@ def generate_schedule(tasks_df, people_df, min_rest_hours, horizon_start_dt, hor
     if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
         schedule = []
         for s in shifts:
+            # בשביל התצוגה - נציג כל אדם תחת הדרגה האמיתית שלו, גם אם מילא מקום של לוחם!
             assigned_off = [p for p in present if people_roles[p] == "קצין" and (p, s['idx']) in x and solver.value(x[(p, s['idx'])])]
             assigned_cmd = [p for p in present if people_roles[p] == "מפקד" and (p, s['idx']) in x and solver.value(x[(p, s['idx'])])]
             assigned_sol = [p for p in present if people_roles[p] == "לוחם" and (p, s['idx']) in x and solver.value(x[(p, s['idx'])])]
@@ -352,7 +350,6 @@ def generate_schedule(tasks_df, people_df, min_rest_hours, horizon_start_dt, hor
         df = df.sort_values(by=["סדר"]).drop(columns=["סדר"])
         return df, "השיבוץ הושלם בהצלחה!"
     else:
-        # כאן אנו מריצים את הדיאגנוסטיקה החכמה שלנו אם החישוב נכשל
         diagnostic_msg = diagnose_failure(shifts, avail_off, avail_cmd, avail_sol, len(present), min_rest_hours, horizon_start_dt)
         return None, f"האלגוריתם לא הצליח לבנות שיבוץ תקין.\n\n**סיבת הכישלון המרכזית:** {diagnostic_msg}"
 
@@ -553,7 +550,7 @@ with tab3:
             mime="text/csv",
         )
     elif "latest_msg" in st.session_state and st.session_state.latest_result is None:
-        # הודעת שגיאה מסודרת (בלי markdown שבור) עם הסבר ברור
+        # הודעת שגיאה מסודרת עם פירוט סיבת הכישלון מהדיאגנוסטיקה
         st.error("האלגוריתם לא מצא פתרון תקין")
         st.warning(st.session_state.latest_msg)
         
