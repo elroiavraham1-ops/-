@@ -153,6 +153,41 @@ def fmt(minute, horizon_start_dt):
     return (horizon_start_dt + timedelta(minutes=minute)).strftime("%H:%M")
 
 # ==========================================
+# דיאגנוסטיקה - למה האלגוריתם נכשל?
+# ==========================================
+def diagnose_failure(shifts, avail_off, avail_cmd, avail_sol, present_count, min_rest_hours, horizon_start_dt):
+    timeline = {}
+    # בניית ציר זמן (דקה אחרי דקה) לראות כמה אנשים צריכים בו זמנית
+    for s in shifts:
+        for t in range(s['start'], s['end']):
+            if t not in timeline:
+                timeline[t] = {'off': 0, 'cmd': 0, 'sol': 0, 'tasks': set()}
+            timeline[t]['off'] += s['need_off']
+            timeline[t]['cmd'] += s['need_cmd']
+            timeline[t]['sol'] += s['need_sol']
+            timeline[t]['tasks'].add(s['name'])
+            
+    # סריקת ציר הזמן למציאת שעות שיא של עומס (צווארי בקבוק)
+    for t in sorted(timeline.keys()):
+        counts = timeline[t]
+        time_str = fmt(t, horizon_start_dt)
+        tasks_str = ", ".join(counts['tasks'])
+        
+        if counts['off'] > avail_off:
+            return f"בשעה {time_str} חסרים קצינים. המשימות באותה שעה ({tasks_str}) דורשות יחד {counts['off']} קצינים במקביל, אך יש רק {avail_off} זמינים במוצב."
+        if counts['cmd'] > avail_cmd:
+            return f"בשעה {time_str} חסרים מפקדים. המשימות באותה שעה ({tasks_str}) דורשות יחד {counts['cmd']} מפקדים במקביל, אך יש רק {avail_cmd} זמינים במוצב."
+        if counts['sol'] > avail_sol:
+            return f"בשעה {time_str} חסרים לוחמים. המשימות באותה שעה ({tasks_str}) דורשות יחד {counts['sol']} לוחמים במקביל, אך יש רק {avail_sol} זמינים במוצב."
+            
+        total_need = counts['off'] + counts['cmd'] + counts['sol']
+        if total_need > present_count:
+            return f"בשעה {time_str} חסר כוח אדם באופן כללי. המשימות באותה שעה ({tasks_str}) דורשות במקביל {total_need} אנשים, אך יש רק {present_count} נוכחים במוצב."
+            
+    # אם אין חוסר נקודתי בכוח אדם באף שנייה, הבעיה היא חוקי המנוחה
+    return f"אין מספיק חיילים זמינים כדי לכסות גם את המשימות וגם את זמני המנוחה ({min_rest_hours} שעות). האלגוריתם נתקע כי לוחמים שסיימו משמרת חייבים לנוח, ולא נשארו מספיק לוחמים רעננים שיחליפו אותם. נסה להוריד את שעות המנוחה המינימליות או להוסיף כוח אדם."
+
+# ==========================================
 # 2. מנוע השיבוץ המתמטי (OR-Tools)
 # ==========================================
 def generate_schedule(tasks_df, people_df, min_rest_hours, horizon_start_dt, horizon_hours=24):
@@ -162,7 +197,6 @@ def generate_schedule(tasks_df, people_df, min_rest_hours, horizon_start_dt, hor
 
     shifts = []
     for idx, row in tasks_df.iterrows():
-        # דילוג על משימות שאינן פעילות
         if not bool(row.get('פעיל?', True)):
             continue
             
@@ -228,6 +262,7 @@ def generate_schedule(tasks_df, people_df, min_rest_hours, horizon_start_dt, hor
     avail_cmd = sum(1 for p in present if people_roles[p] == "מפקד")
     avail_sol = sum(1 for p in present if people_roles[p] == "לוחם")
     
+    # בדיקת חוסר תפקידים ברמת המשימה הבודדת (לפני חישוב זמנים מורכב)
     for s in shifts:
         if s['need_off'] > avail_off:
             return None, f"חסרים קצינים: במשימה '{s['name']}' נדרשים {s['need_off']} קצינים, אך יש רק {avail_off} זמינים."
@@ -236,7 +271,6 @@ def generate_schedule(tasks_df, people_df, min_rest_hours, horizon_start_dt, hor
         if s['need_sol'] > avail_sol:
             return None, f"חסרים לוחמים: במשימה '{s['name']}' נדרשים {s['need_sol']} לוחמים, אך יש רק {avail_sol} זמינים."
 
-    # אם אין אף משימה פעילה
     if not shifts:
         return None, "לא סומנו משימות פעילות לשיבוץ."
 
@@ -318,7 +352,9 @@ def generate_schedule(tasks_df, people_df, min_rest_hours, horizon_start_dt, hor
         df = df.sort_values(by=["סדר"]).drop(columns=["סדר"])
         return df, "השיבוץ הושלם בהצלחה!"
     else:
-        return None, "לא נמצא פתרון. נסה להוריד שעות מנוחה, לבדוק שאין כמות גדולה מדי של עמדות במקביל, או להוסיף כוח אדם."
+        # כאן אנו מריצים את הדיאגנוסטיקה החכמה שלנו אם החישוב נכשל
+        diagnostic_msg = diagnose_failure(shifts, avail_off, avail_cmd, avail_sol, len(present), min_rest_hours, horizon_start_dt)
+        return None, f"האלגוריתם לא הצליח לבנות שיבוץ תקין.\n\n**סיבת הכישלון המרכזית:** {diagnostic_msg}"
 
 # ==========================================
 # 3. ניהול נתונים (State)
@@ -517,6 +553,8 @@ with tab3:
             mime="text/csv",
         )
     elif "latest_msg" in st.session_state and st.session_state.latest_result is None:
-        st.error(f"❌ {st.session_state.latest_msg}")
+        # הודעת שגיאה מסודרת (בלי markdown שבור) עם הסבר ברור
+        st.error("האלגוריתם לא מצא פתרון תקין")
+        st.warning(st.session_state.latest_msg)
         
     st.markdown("</div>", unsafe_allow_html=True)
