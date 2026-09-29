@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 from datetime import datetime, timedelta, time as dtime
 import itertools
+import re
 
 # הגדרות תצוגה
 st.set_page_config(
@@ -18,7 +19,6 @@ st.markdown("""
     <style>
     @import url('https://fonts.googleapis.com/css2?family=Rubik:ital,wght@0,300;0,400;0,500;0,700;1,400&display=swap');
     
-    /* פונט גלובלי ויישור RTL */
     html, body, [class*="css"], .stApp {
         font-family: 'Rubik', sans-serif !important;
         direction: rtl;
@@ -26,7 +26,6 @@ st.markdown("""
         background-color: #F8FAFC;
     }
     
-    /* תפריט הצד */
     [data-testid="stSidebar"] {
         direction: rtl;
         text-align: right;
@@ -34,7 +33,6 @@ st.markdown("""
         border-left: 1px solid #E2E8F0;
     }
     
-    /* כרטיסיות עיצוב כלליות */
     .dashboard-card {
         background-color: #FFFFFF;
         border-radius: 16px;
@@ -44,7 +42,6 @@ st.markdown("""
         box-shadow: 0 4px 12px rgba(0, 0, 0, 0.03);
     }
     
-    /* כותרות מעוצבות */
     .section-title {
         color: #0F172A;
         font-weight: 700;
@@ -60,7 +57,6 @@ st.markdown("""
         margin-bottom: 18px;
     }
     
-    /* כפתורי Tabs מעוצבים */
     .stTabs [data-baseweb="tab-list"] {
         gap: 12px;
         background-color: transparent;
@@ -82,19 +78,6 @@ st.markdown("""
         background-color: #EFF6FF !important;
     }
 
-    /* קוביות מדדים (Metrics) */
-    [data-testid="stMetricValue"] {
-        font-family: 'Rubik', sans-serif !important;
-        color: #1E293B !important;
-        font-size: 28px !important;
-        font-weight: 700 !important;
-    }
-    [data-testid="stMetricLabel"] {
-        color: #64748B !important;
-        font-size: 14px !important;
-    }
-    
-    /* כפתור הרצה ראשי */
     div.stButton > button[kind="primary"] {
         background: linear-gradient(135deg, #1E40AF 0%, #2563EB 100%);
         color: #FFFFFF;
@@ -114,7 +97,6 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
-# ייבוא OR-Tools
 try:
     from ortools.sat.python import cp_model
 except ImportError:
@@ -152,9 +134,6 @@ def resolve_window(start_str, end_str, horizon_start_dt, horizon_hours=24):
 def fmt(minute, horizon_start_dt):
     return (horizon_start_dt + timedelta(minutes=minute)).strftime("%H:%M")
 
-# ==========================================
-# דיאגנוסטיקה - למה האלגוריתם נכשל?
-# ==========================================
 def diagnose_failure(shifts, avail_off, avail_cmd, avail_sol, present_count, min_rest_hours, horizon_start_dt):
     timeline = {}
     for s in shifts:
@@ -171,7 +150,6 @@ def diagnose_failure(shifts, avail_off, avail_cmd, avail_sol, present_count, min
         time_str = fmt(t, horizon_start_dt)
         tasks_str = ", ".join(counts['tasks'])
         
-        # בדיקה היררכית
         if counts['off'] > avail_off:
             return f"בשעה {time_str} חסרים קצינים. המשימות באותה שעה ({tasks_str}) דורשות יחד {counts['off']} קצינים במקביל, אך יש רק {avail_off} זמינים במוצב."
         if counts['off'] + counts['cmd'] > avail_off + avail_cmd:
@@ -179,9 +157,16 @@ def diagnose_failure(shifts, avail_off, avail_cmd, avail_sol, present_count, min
             
         total_need = counts['off'] + counts['cmd'] + counts['sol']
         if total_need > present_count:
-            return f"בשעה {time_str} חסר כוח אדם באופן כללי. המשימות באותה שעה ({tasks_str}) דורשות במקביל {total_need} אנשים, אך יש רק {present_count} נוכחים במוצב."
+            return f"בשעה {time_str} חסר כוח אדם. המשימות ({tasks_str}) דורשות {total_need} אנשים, אך יש רק {present_count} נוכחים."
             
-    return f"אין מספיק חיילים זמינים כדי לכסות גם את המשימות וגם את זמני המנוחה ({min_rest_hours} שעות). האלגוריתם נתקע כי לוחמים שסיימו משמרת חייבים לנוח, ולא נשארו מספיק לוחמים רעננים שיחליפו אותם. נסה להוריד את שעות המנוחה המינימליות או להוסיף כוח אדם."
+    return f"אין מספיק חיילים זמינים כדי לכסות גם את המשימות וגם את זמני המנוחה ({min_rest_hours} שעות). המערכת נתקעת כי הלוחמים חייבים לנוח ואין מחליפים. נסה להוריד את שעות המנוחה או להוסיף כוח אדם."
+
+# פונקציית עזר לחיפוש חייל בתוך מחרוזת הצוות
+def is_person_in_team(team_str, p_name):
+    if pd.isna(team_str): return False
+    clean_str = team_str.replace("🎖️", "").replace("⚔️", "").replace("🛡️", "").replace("|", ",")
+    parts = [x.strip() for x in clean_str.split(",")]
+    return p_name in parts
 
 # ==========================================
 # 2. מנוע השיבוץ המתמטי (OR-Tools)
@@ -245,30 +230,23 @@ def generate_schedule(tasks_df, people_df, min_rest_hours, horizon_start_dt, hor
         
         unavail = resolve_window(row.get('לא זמין מ- (HH:MM)'), row.get('לא זמין עד- (HH:MM)'), horizon_start_dt, horizon_hours)
         p_block = set()
-        
         for s in shifts:
             if any(max(0, min(s['end'], b) - max(s['start'], a)) > 0 for a, b in unavail):
                 p_block.add(s['idx'])
         blocked[pname] = p_block
 
-    if not present:
-        return None, "אין אנשים זמינים במוצב להרכבת השיבוץ."
+    if not present: return None, "אין אנשים זמינים במוצב להרכבת השיבוץ."
 
     avail_off = sum(1 for p in present if people_roles[p] == "קצין")
     avail_cmd = sum(1 for p in present if people_roles[p] == "מפקד")
     avail_sol = sum(1 for p in present if people_roles[p] == "לוחם")
     
-    # בדיקת חוסר תפקידים ברמת המשימה הבודדת (בדיקה היררכית)
     for s in shifts:
-        if s['need_off'] > avail_off:
-            return None, f"חסרים קצינים: במשימה '{s['name']}' נדרשים {s['need_off']} קצינים."
-        if s['need_off'] + s['need_cmd'] > avail_off + avail_cmd:
-            return None, f"חסרים מפקדים: במשימה '{s['name']}' נדרשים {s['need_cmd']} מפקדים (יחד עם הקצינים חסר פיקוד)."
-        if s['need_off'] + s['need_cmd'] + s['need_sol'] > avail_off + avail_cmd + avail_sol:
-            return None, f"חסר כוח אדם: במשימה '{s['name']}' נדרשים {s['need_sol']} לוחמים."
+        if s['need_off'] > avail_off: return None, f"חסרים קצינים: במשימה '{s['name']}' נדרשים {s['need_off']} קצינים."
+        if s['need_off'] + s['need_cmd'] > avail_off + avail_cmd: return None, f"חסרים מפקדים: במשימה '{s['name']}' נדרשים {s['need_cmd']} מפקדים."
+        if s['need_off'] + s['need_cmd'] + s['need_sol'] > avail_off + avail_cmd + avail_sol: return None, f"חסר כוח אדם: במשימה '{s['name']}' חסרים לוחמים."
 
-    if not shifts:
-        return None, "לא סומנו משימות פעילות לשיבוץ."
+    if not shifts: return None, "לא סומנו משימות פעילות לשיבוץ."
 
     total_units = sum(hist_u.values()) + sum((s['need_off'] + s['need_cmd'] + s['need_sol']) * s['units'] for s in shifts)
     target = int(round(total_units / len(present)))
@@ -287,7 +265,6 @@ def generate_schedule(tasks_df, people_df, min_rest_hours, horizon_start_dt, hor
     for p in present:
         for s in shifts:
             if s['idx'] in blocked[p]: continue
-            # יוצרים משתנה לכולם עבור כל משמרת פתוחה, כדי לאפשר למפקדים לרדת לרמת לוחם
             x[(p, s['idx'])] = m.new_bool_var(f"x_{p}_{s['idx']}")
 
     for s in shifts:
@@ -295,12 +272,8 @@ def generate_schedule(tasks_df, people_df, min_rest_hours, horizon_start_dt, hor
         staffed_cmd = sum(x[(p, s['idx'])] for p in present if people_roles[p] == "מפקד" and (p, s['idx']) in x)
         staffed_sol = sum(x[(p, s['idx'])] for p in present if people_roles[p] == "לוחם" and (p, s['idx']) in x)
         
-        # אילוצים היררכיים (תחליפיות)
-        # 1. חייבים מספיק קצינים לתפקיד קצין
         m.add(staffed_off >= s['need_off'])
-        # 2. קצינים + מפקדים יכולים למלא תפקידי פיקוד
         m.add(staffed_off + staffed_cmd >= s['need_off'] + s['need_cmd'])
-        # 3. סך הכל האנשים (כולל לוחמים) חייב להיות בדיוק המספר הנדרש
         m.add(staffed_off + staffed_cmd + staffed_sol == s['need_off'] + s['need_cmd'] + s['need_sol'])
 
     for p in present:
@@ -328,7 +301,6 @@ def generate_schedule(tasks_df, people_df, min_rest_hours, horizon_start_dt, hor
     if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
         schedule = []
         for s in shifts:
-            # בשביל התצוגה - נציג כל אדם תחת הדרגה האמיתית שלו, גם אם מילא מקום של לוחם!
             assigned_off = [p for p in present if people_roles[p] == "קצין" and (p, s['idx']) in x and solver.value(x[(p, s['idx'])])]
             assigned_cmd = [p for p in present if people_roles[p] == "מפקד" and (p, s['idx']) in x and solver.value(x[(p, s['idx'])])]
             assigned_sol = [p for p in present if people_roles[p] == "לוחם" and (p, s['idx']) in x and solver.value(x[(p, s['idx'])])]
@@ -339,16 +311,15 @@ def generate_schedule(tasks_df, people_df, min_rest_hours, horizon_start_dt, hor
             if assigned_sol: team_parts.append(f"🛡️ {', '.join(assigned_sol)}")
             
             schedule.append({
-                "סדר": s['start'],
+                "start_min": s['start'],
+                "end_min": s['end'],
                 "שעת התחלה": fmt(s['start'], horizon_start_dt),
                 "שעת סיום": fmt(s['end'], horizon_start_dt),
                 "סוג": s['kind'],
                 "משימה": s['name'],
                 "צוות משובץ": "   |   ".join(team_parts)
             })
-        df = pd.DataFrame(schedule)
-        df = df.sort_values(by=["סדר"]).drop(columns=["סדר"])
-        return df, "השיבוץ הושלם בהצלחה!"
+        return pd.DataFrame(schedule), "השיבוץ הושלם בהצלחה!"
     else:
         diagnostic_msg = diagnose_failure(shifts, avail_off, avail_cmd, avail_sol, len(present), min_rest_hours, horizon_start_dt)
         return None, f"האלגוריתם לא הצליח לבנות שיבוץ תקין.\n\n**סיבת הכישלון המרכזית:** {diagnostic_msg}"
@@ -358,13 +329,11 @@ def generate_schedule(tasks_df, people_df, min_rest_hours, horizon_start_dt, hor
 # ==========================================
 if "people_data" not in st.session_state:
     names_seed = [
-        ("אלרואי (קצין)", "קצין"), ("גיא (מפקד)", "מפקד"), ("בן (מפקד)", "מפקד"),
-        ("דן (מפקד)", "מפקד"), ("יוסי (מפקד)", "מפקד"), ("עומר", "לוחם"),
-        ("תומר", "לוחם"), ("עידו", "לוחם"), ("איתי", "לוחם"), ("רועי", "לוחם"),
-        ("נועם", "לוחם"), ("דניאל", "לוחם"), ("ינאי", "לוחם"), ("אלי", "לוחם"),
-        ("רמי", "לוחם"), ("רון", "לוחם"), ("ליאור", "לוחם"), ("גל", "לוחם"),
-        ("פבל", "לוחם"), ("פטריק", "לוחם"), ("מקס", "לוחם"), ("הראל", "לוחם"),
-        ("סמי", "לוחם"), ("אבי", "לוחם"), ("נדב", "לוחם")
+        ("אלרואי", "קצין"), ("גיא", "מפקד"), ("בן", "מפקד"), ("דן", "מפקד"), ("יוסי", "מפקד"), 
+        ("עומר", "לוחם"), ("תומר", "לוחם"), ("עידו", "לוחם"), ("איתי", "לוחם"), ("רועי", "לוחם"),
+        ("נועם", "לוחם"), ("דניאל", "לוחם"), ("ינאי", "לוחם"), ("אלי", "לוחם"), ("רמי", "לוחם"), 
+        ("רון", "לוחם"), ("ליאור", "לוחם"), ("גל", "לוחם"), ("פבל", "לוחם"), ("פטריק", "לוחם"), 
+        ("מקס", "לוחם"), ("הראל", "לוחם"), ("סמי", "לוחם"), ("אבי", "לוחם"), ("נדב", "לוחם")
     ]
     st.session_state.people_data = pd.DataFrame([
         {"שם": name, "תפקיד": role, "שעות היסטוריות": 0.0, "יצא הביתה?": False, "לא זמין מ- (HH:MM)": "", "לא זמין עד- (HH:MM)": ""}
@@ -384,14 +353,11 @@ if "tasks_data" not in st.session_state:
         {"פעיל?": True, "שם משימה": "סיור 4 - יום", "סוג": "סיור", "כמות קצינים": 0, "כמות מפקדים": 1, "כמות לוחמים": 6, "אורך משמרת (שעות)": 4.0, "שעת התחלה (HH:MM)": "16:00", "שעת סיום (HH:MM)": "20:00", "נחשב עבודה?": True, "דורש מנוחה?": True},
         {"פעיל?": True, "שם משימה": "כרמל א'", "סוג": "כוננות", "כמות קצינים": 0, "כמות מפקדים": 1, "כמות לוחמים": 5, "אורך משמרת (שעות)": 4.0, "שעת התחלה (HH:MM)": "", "שעת סיום (HH:MM)": "", "נחשב עבודה?": False, "דורש מנוחה?": False},
         {"פעיל?": True, "שם משימה": "כרמל ב'", "סוג": "כוננות", "כמות קצינים": 0, "כמות מפקדים": 1, "כמות לוחמים": 5, "אורך משמרת (שעות)": 4.0, "שעת התחלה (HH:MM)": "", "שעת סיום (HH:MM)": "", "נחשב עבודה?": False, "דורש מנוחה?": False},
-        {"פעיל?": False, "שם משימה": "תורן מטבח", "סוג": "מטבח", "כמות קצינים": 0, "כמות מפקדים": 0, "כמות לוחמים": 1, "אורך משמרת (שעות)": 24.0, "שעת התחלה (HH:MM)": "", "שעת סיום (HH:MM)": "", "נחשב עבודה?": True, "דורש מנוחה?": True},
     ])
 
 # ==========================================
 # 4. ממשק משתמש פרימיום
 # ==========================================
-
-# כותרת ראשית (Hero Banner)
 st.markdown("""
 <div style="background: linear-gradient(135deg, #0F172A 0%, #1E3A8A 100%); padding: 30px; border-radius: 20px; color: white; margin-bottom: 25px; box-shadow: 0 10px 25px rgba(15,23,42,0.15);">
     <h1 style="margin: 0; font-size: 32px; font-weight: 700;">🛡️ מערכת שיבוץ וניהול משמרות</h1>
@@ -399,7 +365,6 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
-# סיידבר מעוצב
 with st.sidebar:
     st.markdown("### ⚙️ הגדרות לו\"ז")
     start_date = st.date_input("📅 תאריך תחילת הלוז:", value=datetime.today())
@@ -418,7 +383,6 @@ with st.sidebar:
     </div>
     """, unsafe_allow_html=True)
 
-# לשוניות הניווט (Tabs)
 tab1, tab2, tab3 = st.tabs(["👥 1. ניהול כוח אדם", "📋 2. הגדרת משימות", "🚀 3. הרצה ותוצאות"])
 
 # --- דף 1: כוח אדם ---
@@ -426,14 +390,11 @@ with tab1:
     st.markdown("""
     <div class="dashboard-card">
         <div class="section-title">👥 ניהול הסד"כ ואילוצי הנוכחות</div>
-        <div class="section-subtitle">הגדר את שמות החיילים, תפקידיהם (לוחם / מפקד / קצין) ושעות אי-זמינות.</div>
     """, unsafe_allow_html=True)
     
-    # חישוב נתונים חיים לכרטיסיות
     df_curr = st.session_state.people_data
     total_count = len(df_curr)
-    home_count = sum(df_curr['יצא הביתה?'])
-    active_count = total_count - home_count
+    active_count = total_count - sum(df_curr['יצא הביתה?'])
     officers = sum((df_curr['תפקיד'] == 'קצין') & (~df_curr['יצא הביתה?']))
     commanders = sum((df_curr['תפקיד'] == 'מפקד') & (~df_curr['יצא הביתה?']))
     soldiers = sum((df_curr['תפקיד'] == 'לוחם') & (~df_curr['יצא הביתה?']))
@@ -444,25 +405,8 @@ with tab1:
     col_m3.metric("קצינים זמינים", officers)
     col_m4.metric("מפקדים זמינים", commanders)
     col_m5.metric("לוחמים זמינים", soldiers)
-    
     st.markdown("<br>", unsafe_allow_html=True)
     
-    # שליטה מהירה בכמות השורות
-    col_ctrl1, col_ctrl2 = st.columns([1, 4])
-    with col_ctrl1:
-        desired_count = st.number_input("שינוי גודל הסד\"כ:", min_value=1, max_value=100, value=total_count)
-    with col_ctrl2:
-        st.write("")
-        st.write("")
-        if st.button("🔄 התאם גודל רשימה"):
-            if desired_count > total_count:
-                new_rows = [{"שם": f"חייל {i+1}", "תפקיד": "לוחם", "שעות היסטוריות": 0.0, "יצא הביתה?": False, "לא זמין מ- (HH:MM)": "", "לא זמין עד- (HH:MM)": ""} for i in range(total_count, desired_count)]
-                st.session_state.people_data = pd.concat([st.session_state.people_data, pd.DataFrame(new_rows)], ignore_index=True)
-            elif desired_count < total_count:
-                st.session_state.people_data = st.session_state.people_data.head(desired_count)
-            st.rerun()
-
-    # טבלת העריכה
     people_df = st.data_editor(
         st.session_state.people_data, 
         num_rows="dynamic", 
@@ -482,7 +426,6 @@ with tab2:
     st.markdown("""
     <div class="dashboard-card">
         <div class="section-title">📋 הגדרת עמדות, סיורים ומשימות</div>
-        <div class="section-subtitle">אם אינך צריך משימה מסוימת היום (כמו מטבח), פשוט הורד ממנה את ה-V בעמודת "פעיל?" והמערכת תתעלם ממנה.</div>
     """, unsafe_allow_html=True)
     
     tasks_df = st.data_editor(
@@ -504,54 +447,81 @@ with tab2:
     st.session_state.tasks_data = tasks_df
     st.markdown("</div>", unsafe_allow_html=True)
 
-# --- דף 3: הרצה ותוצאות ---
+# --- דף 3: הרצה ותוצאות מתקדמות ---
 with tab3:
     st.markdown("""
     <div class="dashboard-card">
         <div class="section-title">🚀 הפקת סידור עבודה אוטומטי</div>
-        <div class="section-subtitle">המערכת תפתור את כל האילוצים בצורה מתמטית ותייצר שיבוץ הוגן ומדויק רק למשימות המסומנות כ'פעילות'.</div>
     """, unsafe_allow_html=True)
     
     if st.button("⚡ הפעל אלגוריתם שיבוץ", type="primary"):
         with st.spinner('המנוע המתמטי מחשב את חלוקת הנטל הטובה ביותר...'):
             result_df, msg = generate_schedule(st.session_state.tasks_data, st.session_state.people_data, min_rest_ui, horizon_start_dt)
-            
-            if result_df is not None:
-                st.session_state.latest_result = result_df
-                st.session_state.latest_msg = msg
-            else:
-                st.session_state.latest_result = None
-                st.session_state.latest_msg = msg
+            st.session_state.latest_result = result_df
+            st.session_state.latest_msg = msg
 
     if "latest_result" in st.session_state and st.session_state.latest_result is not None:
         res = st.session_state.latest_result
         st.success(f"✔️ {st.session_state.latest_msg}")
         
-        # סינון מהיר מעל הטבלה
-        search_filter = st.text_input("🔍 חיפוש / סינון לפי שם חייל או עמדה:", "")
-        if search_filter:
-            filtered_df = res[res.apply(lambda r: r.astype(str).str.contains(search_filter).any(), axis=1)]
-        else:
-            filtered_df = res
-            
-        st.dataframe(
-            filtered_df, 
-            use_container_width=True, 
-            hide_index=True, 
-            height=580
-        )
+        # --- תצוגת טבלה ראשית ---
+        st.markdown("### 🗓️ לוח משמרות כללי")
+        view_mode = st.radio("סדר תצוגה:", ["לפי שעות (כרונולוגי)", "לפי משימות (עמדות)"], horizontal=True)
         
-        # כפתור הורדה מעוצב
-        csv = res.to_csv(index=False).encode('utf-8-sig')
+        if "משימות" in view_mode:
+            display_df = res.sort_values(by=["משימה", "start_min"]).drop(columns=["start_min", "end_min"])
+        else:
+            display_df = res.sort_values(by=["start_min", "משימה"]).drop(columns=["start_min", "end_min"])
+            
+        st.dataframe(display_df, use_container_width=True, hide_index=True, height=400)
+        
+        # --- אזור לו"ז אישי (Timeline) ---
+        st.markdown("---")
+        st.markdown("### 🧑‍💻 לו\"ז אישי ומעקב מנוחות")
+        
+        active_people = st.session_state.people_data[~st.session_state.people_data['יצא הביתה?']]['שם'].tolist()
+        selected_person = st.selectbox("🔍 בחר לוחם/מפקד לצפייה בציר הזמן האישי שלו:", [""] + active_people)
+        
+        if selected_person:
+            # מציאת כל המשמרות שבהן מופיע השם (שימוש בפונקציית העזר)
+            person_shifts = res[res['צוות משובץ'].apply(lambda team: is_person_in_team(team, selected_person))].sort_values("start_min")
+            
+            if person_shifts.empty:
+                st.info(f"לא שובצו משמרות עבור **{selected_person}** בלו\"ז זה.")
+            else:
+                for i in range(len(person_shifts)):
+                    row = person_shifts.iloc[i]
+                    
+                    st.markdown(f"""
+                    <div style='background-color:#F8FAFC; border-right:4px solid #3B82F6; padding:12px; margin-bottom:4px; border-radius:6px;'>
+                        <strong style='color:#1E3A8A; font-size:16px;'>{row['שעת התחלה']} - {row['שעת סיום']}</strong> &nbsp;&nbsp;|&nbsp;&nbsp; 
+                        <span style='color:#334155; font-weight:500;'>{row['משימה']} ({row['סוג']})</span>
+                    </div>
+                    """, unsafe_allow_html=True)
+                    
+                    # חישוב זמן מנוחה עד המשמרת הבאה
+                    if i < len(person_shifts) - 1:
+                        next_row = person_shifts.iloc[i+1]
+                        rest_mins = next_row['start_min'] - row['end_min']
+                        
+                        if rest_mins > 0:
+                            rest_hrs = rest_mins / 60.0
+                            color = "#10B981" if rest_hrs >= min_rest_ui else "#F59E0B"
+                            st.markdown(f"<div style='color:{color}; font-size:14px; margin-right:25px; margin-bottom:12px;'>☕ זמן מנוחה: {rest_hrs:.1f} שעות</div>", unsafe_allow_html=True)
+                        elif rest_mins == 0:
+                            st.markdown(f"<div style='color:#EF4444; font-size:14px; margin-right:25px; margin-bottom:12px;'>⚡ מעבר מיידי למשימה הבאה (ללא מנוחה)</div>", unsafe_allow_html=True)
+
+        st.markdown("---")
+        csv = res.drop(columns=["start_min", "end_min"]).to_csv(index=False).encode('utf-8-sig')
         st.download_button(
-            label="📥 הורד סידור עבודה לקובץ Excel / CSV",
+            label="📥 הורד סידור עבודה לקובץ Excel",
             data=csv,
             file_name=f"guard_roster_{start_date.strftime('%Y_%m_%d')}.csv",
             mime="text/csv",
         )
+        
     elif "latest_msg" in st.session_state and st.session_state.latest_result is None:
-        # הודעת שגיאה מסודרת עם פירוט סיבת הכישלון מהדיאגנוסטיקה
         st.error("האלגוריתם לא מצא פתרון תקין")
         st.warning(st.session_state.latest_msg)
         
-    st.markdown("</div>", unsafe_allow_html=True)
+    st.markdown("</div>", unsafe_allow_html=True)                                                         
